@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi import APIRouter, HTTPException, Query, Form
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
+from qrcode.image.pil import PilImage
 from sqlmodel import Session
 from app.schemas.mfa import GenerateRequest, GenerateResponse, VerifyTokenRequest
 from app.utils.totp import generate_totp_secret, get_otpauth_url, generate_qrcode_base64, verify_totp_token
@@ -76,7 +77,7 @@ def get_qrcode_image(
     qr.add_data(otpauth_url)
     qr.make(fit=True)
 
-    img = qr.make_image(fill_color="black", back_color="white")
+    img = qr.make_image(fill_color="black", back_color="white", image_factory=PilImage)
     img_io = BytesIO()
     img.save(img_io, format="PNG")
     img_io.seek(0)
@@ -109,3 +110,57 @@ def mfa_demo(username: str = "demo"):
         </body>
     </html>
     """
+
+
+@router.get("/status")
+def check_mfa_status(username: str = Query(...)):
+    with Session(engine) as session:
+        secret_entry = session.get(MFASecret, username)
+        return {"registered": secret_entry is not None}
+
+@router.get("/start", response_class=HTMLResponse)
+def mfa_start(username: str = Query(...), next: str = Query("/")):
+    issuer = os.getenv("ISSUER_NAME", "MultipleAuth")
+    with Session(engine) as session:
+        secret_entry = session.get(MFASecret, username)
+
+        if not secret_entry:
+            secret = generate_totp_secret()
+            otpauth_url = get_otpauth_url(secret, username, issuer)
+            qrcode_base64 = generate_qrcode_base64(otpauth_url)
+
+            session.add(MFASecret(username=username, secret=secret))
+            session.commit()
+
+            return f"""
+            <html><body style='font-family:sans-serif; text-align:center'>
+                <h2>Configure o MFA</h2>
+                <p>Escaneie o QR Code com seu autenticador</p>
+                <img src='data:image/png;base64,{qrcode_base64}' />
+                <p>Após escanear, volte e acesse novamente o sistema.</p>
+            </body></html>
+            """
+
+        return f"""
+        <html><body style='font-family:sans-serif; text-align:center'>
+            <h2>Digite seu código de autenticação</h2>
+            <form method='post' action='/mfa/validate'>
+                <input type='hidden' name='username' value='{username}' />
+                <input type='hidden' name='next' value='{next}' />
+                <input type='text' name='token' placeholder='Código MFA' required />
+                <button type='submit'>Validar</button>
+            </form>
+        </body></html>
+        """
+
+@router.post("/validate")
+def validate_token(username: str = Form(...), token: str = Form(...), next: str = Form("/")):
+    with Session(engine) as session:
+        secret_entry = session.get(MFASecret, username)
+        if not secret_entry:
+            return HTMLResponse("<h3>Erro: MFA não encontrado.</h3>", status_code=404)
+
+        is_valid = verify_totp_token(secret_entry.secret, token)
+
+    callback_url = f"/mfa/callback?username={username}&status={'success' if is_valid else 'fail'}&next={next}"
+    return RedirectResponse(callback_url, status_code=302)
